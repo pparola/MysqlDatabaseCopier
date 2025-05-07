@@ -6,7 +6,11 @@ namespace MySQLDatabaseCopier
 {
     class Program
     {
-        private static readonly string _configFilePath = Path.Combine( AppContext.BaseDirectory, "configurations.json");
+        private static readonly string _configFilePath = Path.Combine(
+            AppContext.BaseDirectory, // O AppDomain.CurrentDomain.BaseDirectory
+            "configurations.json");
+
+        private const int FetchBatchSize = 5000; // Tamaño del lote para la lectura desde origen
 
         static async Task Main(string[] args)
         {
@@ -60,36 +64,28 @@ namespace MySQLDatabaseCopier
                 string sourceConnectionString = BuildConnectionString(selectedConfig.Source);
                 string targetConnectionString = BuildConnectionString(selectedConfig.Target);
 
-                // Obtener todas las tablas de la base de datos origen
+                // Obtener solo las tablas de la base de datos origen
                 List<string> tables = await GetAllTables(sourceConnectionString);
 
                 if (tables.Count == 0)
                 {
-                    Console.WriteLine("No se encontraron tablas en la base de datos de origen.");
+                    Console.WriteLine("No se encontraron tablas para copiar en la base de datos de origen.");
                     return;
                 }
 
-                Console.WriteLine($"Se encontraron {tables.Count} tablas en la base de datos de origen.");
+                Console.WriteLine($"Se encontraron {tables.Count} tablas para copiar en la base de datos de origen:");
                 foreach (var table in tables)
                 {
                     Console.WriteLine($" - {table}");
                 }
 
-                Console.Write("¿Desea continuar con la copia de todas las tablas? (S/N): ");
-                string confirmCopy = Console.ReadLine().ToUpper();
 
-                if (confirmCopy != "S")
-                {
-                    Console.WriteLine("Operación cancelada por el usuario.");
-                    return;
-                }
-
-                int tableCount = 1;
+                int tableCounter = 1;
                 foreach (var tableName in tables)
                 {
-                    Console.WriteLine($"\n[{tableCount}/{tables.Count}] Procesando tabla: {tableName}");
+                    Console.WriteLine($"\n[{tableCounter}/{tables.Count}] Procesando tabla: {tableName}");
                     await CopyTableData(sourceConnectionString, targetConnectionString, tableName);
-                    tableCount++;
+                    tableCounter++;
                 }
 
                 Console.WriteLine("\nProceso completado exitosamente.");
@@ -100,8 +96,6 @@ namespace MySQLDatabaseCopier
                 Console.WriteLine(ex.StackTrace);
             }
 
-            Console.WriteLine("Presione cualquier tecla para salir...");
-            Console.ReadKey();
         }
 
         static ConnectionPair ManageConfigurations(Dictionary<string, ConnectionPair> savedConfigs)
@@ -375,8 +369,6 @@ namespace MySQLDatabaseCopier
             {
                 await connection.OpenAsync();
 
-                // Consulta para obtener solo los nombres de las tablas (TABLE_TYPE = 'BASE TABLE')
-                // del esquema actual (TABLE_SCHEMA = DATABASE())
                 string query = "SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_TYPE = 'BASE TABLE' AND TABLE_SCHEMA = DATABASE()";
 
                 using (var command = new MySqlCommand(query, connection))
@@ -394,37 +386,235 @@ namespace MySQLDatabaseCopier
             return tables;
         }
 
+        // --- START: Modificaciones para carga seccionada ---
 
         static async Task CopyTableData(string sourceConnectionString, string targetConnectionString, string tableName)
         {
             try
             {
-                // Obtener la estructura de la tabla y datos
+                Console.WriteLine($"Obteniendo estructura de la tabla '{tableName}'...");
                 string createTableStatement = await GetCreateTableStatement(sourceConnectionString, tableName);
-                DataTable tableData = await GetTableData(sourceConnectionString, tableName);
 
-                Console.WriteLine($"Tabla: {tableName} - {tableData.Rows.Count} registros encontrados");
+                Console.WriteLine($"Obteniendo clave primaria para '{tableName}'...");
+                string primaryKeyColumn = await GetPrimaryKeyColumn(sourceConnectionString, tableName);
 
-                // Aplicar cambios en el servidor destino
+                // Obtener el número total de registros
+                long totalRecords = await GetTableRowCount(sourceConnectionString, tableName);
+                Console.WriteLine($"Tabla '{tableName}': {totalRecords} registros encontrados.");
+
+                if (totalRecords == 0)
+                {
+                    Console.WriteLine("No hay datos para copiar.");
+                    // Aunque no haya datos, recreamos la tabla en destino
+                    await DropAndCreateTable(targetConnectionString, tableName, createTableStatement);
+                    Console.WriteLine($"Tabla '{tableName}' creada vacía en destino.");
+                    return;
+                }
+
+                // Aplicar cambios en el servidor destino (crear/recrear la tabla)
                 await DropAndCreateTable(targetConnectionString, tableName, createTableStatement);
-                await CopyDataToTargetTable(targetConnectionString, tableName, tableData);
+
+                long processedRecords = 0;
+                int offset = 0;
+                int progressInterval = totalRecords > 10000 ? 1000 : (totalRecords > 1000 ? 100 : 10); // Intervalo de progreso dinámico
+
+                Console.WriteLine($"Copiando datos de la tabla '{tableName}' en lotes de {FetchBatchSize}...");
+
+                while (processedRecords < totalRecords)
+                {
+                    // Obtener un lote de datos del origen
+                    DataTable batchData = await GetTableDataBatch(sourceConnectionString, tableName, FetchBatchSize, offset, primaryKeyColumn);
+
+                    if (batchData.Rows.Count == 0)
+                    {
+                        // Esto debería ocurrir solo si el totalRecords inicial fue incorrecto o hubo modificaciones concurrentes
+                        Console.WriteLine("\nNo se encontraron más registros en el lote actual. Finalizando copia de tabla.");
+                        break;
+                    }
+
+                    // Copiar el lote de datos al destino
+                    await CopyDataToTargetTable(targetConnectionString, tableName, batchData);
+
+                    processedRecords += batchData.Rows.Count;
+                    offset += batchData.Rows.Count; // Incrementar el offset por el número real de filas procesadas en este lote
+
+                    // Mostrar progreso
+                    if (processedRecords % progressInterval == 0 || processedRecords == totalRecords)
+                    {
+                        double percentage = (double)processedRecords / totalRecords * 100;
+                        Console.Write($"\rProgreso tabla '{tableName}': {processedRecords}/{totalRecords} registros ({percentage:F2}%)");
+                    }
+                }
+                Console.Write($"\rProgreso tabla '{tableName}': {processedRecords}/{totalRecords} registros (100.00%)\n"); // Asegurarse de mostrar 100% al final
+
+
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"Error al copiar la tabla {tableName}: {ex.Message}");
-                // Si estamos en modo multi-tabla, continuamos con la siguiente
-                if (ex.Message.Contains("doesn't exist"))
+                Console.WriteLine($"\nError al copiar la tabla {tableName}: {ex.Message}");
+                Console.WriteLine(ex.StackTrace);
+                // Decide si quieres lanzar la excepción para detener el programa o continuar con la siguiente tabla
+                // throw; // Descomenta esto si un error en una tabla debe detener todo el proceso
+            }
+        }
+
+        static async Task<long> GetTableRowCount(string connectionString, string tableName)
+        {
+            using (var connection = new MySqlConnection(connectionString))
+            {
+                await connection.OpenAsync();
+                using (var command = new MySqlCommand($"SELECT COUNT(*) FROM `{tableName}`", connection))
                 {
-                    Console.WriteLine($"La tabla {tableName} no existe en la base de datos origen. Continuando con la siguiente tabla.");
-                    return;
+                    var result = await command.ExecuteScalarAsync();
+                    return result != DBNull.Value ? Convert.ToInt64(result) : 0;
+                }
+            }
+        }
+
+        static async Task<string> GetPrimaryKeyColumn(string connectionString, string tableName)
+        {
+            using (var connection = new MySqlConnection(connectionString))
+            {
+                await connection.OpenAsync();
+                // Consulta para encontrar la columna PRIMARY KEY. Considera solo la primera columna si es compuesta.
+                string query = $"SHOW KEYS FROM `{tableName}` WHERE Key_name = 'PRIMARY'";
+                using (var command = new MySqlCommand(query, connection))
+                {
+                    using (var reader = await command.ExecuteReaderAsync())
+                    {
+                        if (await reader.ReadAsync())
+                        {
+                            // La columna 'Column_name' contiene el nombre de la columna en el índice.
+                            return reader.GetString("Column_name");
+                        }
+                        else
+                        {
+                            // Si no hay clave primaria, intentamos ordenar por la primera columna si existe
+                            Console.WriteLine($"Advertencia: La tabla '{tableName}' no tiene una clave primaria. Se intentará ordenar por la primera columna. La copia puede no ser fiable si la tabla no tiene un orden natural consistente.");
+                            using (var getColumnsCommand = new MySqlCommand($"SHOW COLUMNS FROM `{tableName}`", connection))
+                            {
+                                using (var columnsReader = await getColumnsCommand.ExecuteReaderAsync())
+                                {
+                                    if (await columnsReader.ReadAsync())
+                                    {
+                                        return columnsReader.GetString("Field"); // Devuelve el nombre de la primera columna
+                                    }
+                                }
+                            }
+                            throw new Exception($"No se pudo encontrar una clave primaria ni columnas para ordenar en la tabla '{tableName}'.");
+                        }
+                    }
+                }
+            }
+        }
+
+        static async Task<DataTable> GetTableDataBatch(string connectionString, string tableName, int limit, int offset, string orderByColumn)
+        {
+            // Asegurar que orderByColumn esté entre comillas inversas si no lo está ya
+            if (!orderByColumn.StartsWith("`")) orderByColumn = $"`{orderByColumn}`";
+            if (!orderByColumn.EndsWith("`")) orderByColumn = $"{orderByColumn}`";
+
+
+            Console.Write($"\rObteniendo lote (Offset: {offset}, Limit: {limit}) de '{tableName}'..."); // Actualizar el mensaje de obtención
+
+            DataTable dataTable = new DataTable();
+
+            using (var connection = new MySqlConnection(connectionString))
+            {
+                await connection.OpenAsync();
+                // Consulta para obtener un lote específico ordenado por la clave primaria
+                string query = $"SELECT * FROM `{tableName}` ORDER BY {orderByColumn} LIMIT {limit} OFFSET {offset}";
+
+                using (var command = new MySqlCommand(query, connection))
+                {
+                    // No es necesario añadir parámetros para LIMIT/OFFSET, ya que son parte de la sintaxis de la consulta
+                    // MySQL Connector/NET maneja esto directamente en el comando.
+
+                    using (var adapter = new MySqlDataAdapter(command))
+                    {
+                        adapter.Fill(dataTable);
+                    }
+                }
+            }
+
+            return dataTable;
+        }
+
+        // Este método ahora recibe un DataTable que contiene un LOTE de datos
+        static async Task CopyDataToTargetTable(string connectionString, string tableName, DataTable dataTable)
+        {
+            // La verificación de dataTable.Rows.Count == 0 se hace ahora en CopyTableData antes de llamar aquí
+            // Console.WriteLine($"Copiando {dataTable.Rows.Count} registros a la tabla destino..."); // Ya se muestra progreso en CopyTableData
+
+            using (var connection = new MySqlConnection(connectionString))
+            {
+                await connection.OpenAsync();
+
+                // Construir la consulta de inserción
+                var columns = new List<string>();
+                var parameters = new List<string>();
+
+                foreach (DataColumn column in dataTable.Columns)
+                {
+                    columns.Add($"`{column.ColumnName}`");
+                    parameters.Add($"@{column.ColumnName}");
+                }
+
+                // Usamos INSERT IGNORE INTO para manejar posibles duplicados si la tabla tiene UNIQUE/PRIMARY KEY
+                // Otra opción es usar REPLACE INTO si quieres reemplazar en caso de duplicado
+                string insertQuery = $"INSERT IGNORE INTO `{tableName}` ({string.Join(", ", columns)}) VALUES ({string.Join(", ", parameters)})";
+
+                // Batch insert para mejorar el rendimiento DENTRO DE ESTE LOTE
+                int insertBatchSize = 100; // Tamaño del lote para la inserción en destino
+                int totalRecordsInBatch = dataTable.Rows.Count;
+
+                MySqlTransaction transaction = null;
+
+                try
+                {
+                    transaction = await connection.BeginTransactionAsync();
+
+                    for (int i = 0; i < totalRecordsInBatch; i++)
+                    {
+                        using (var command = new MySqlCommand(insertQuery, connection, transaction))
+                        {
+                            command.Parameters.Clear(); // Limpiar parámetros del comando anterior
+                            foreach (DataColumn column in dataTable.Columns)
+                            {
+                                command.Parameters.AddWithValue($"@{column.ColumnName}",
+                                    dataTable.Rows[i][column.ColumnName] ?? DBNull.Value);
+                            }
+
+                            await command.ExecuteNonQueryAsync();
+                        }
+
+                        // Commit cada insertBatchSize registros dentro del lote actual
+                        if ((i + 1) % insertBatchSize == 0 || (i + 1) == totalRecordsInBatch)
+                        {
+                            await transaction.CommitAsync();
+                            if ((i + 1) < totalRecordsInBatch)
+                            {
+                                transaction = await connection.BeginTransactionAsync(); // Iniciar nueva transacción para el siguiente lote de inserción
+                            }
+                        }
+                    }
+
+                    // Console.WriteLine($"Lote de {totalRecordsInBatch} registros copiado."); // Mensaje de lote copiado
+                }
+                catch (Exception ex)
+                {
+                    if (transaction != null)
+                    {
+                        await transaction.RollbackAsync();
+                    }
+                    throw new Exception($"Error al insertar datos en el lote actual de la tabla '{tableName}': {ex.Message}", ex);
                 }
             }
         }
 
         static async Task<string> GetCreateTableStatement(string connectionString, string tableName)
         {
-            Console.WriteLine($"Obteniendo estructura de la tabla '{tableName}'...");
-
+            // El código para obtener la estructura de la tabla es el mismo
             using (var connection = new MySqlConnection(connectionString))
             {
                 await connection.OpenAsync();
@@ -446,30 +636,10 @@ namespace MySQLDatabaseCopier
             }
         }
 
-        static async Task<DataTable> GetTableData(string connectionString, string tableName)
-        {
-            Console.WriteLine($"Obteniendo datos de la tabla '{tableName}'...");
-
-            DataTable dataTable = new DataTable();
-
-            using (var connection = new MySqlConnection(connectionString))
-            {
-                await connection.OpenAsync();
-
-                using (var command = new MySqlCommand($"SELECT * FROM `{tableName}`", connection))
-                {
-                    using (var adapter = new MySqlDataAdapter(command))
-                    {
-                        adapter.Fill(dataTable);
-                    }
-                }
-            }
-
-            return dataTable;
-        }
 
         static async Task DropAndCreateTable(string connectionString, string tableName, string createTableStatement)
         {
+            // El código para eliminar y crear la tabla es el mismo
             Console.WriteLine($"Eliminando y creando tabla '{tableName}' en el servidor destino...");
 
             using (var connection = new MySqlConnection(connectionString))
@@ -490,92 +660,7 @@ namespace MySQLDatabaseCopier
             }
         }
 
-        static async Task CopyDataToTargetTable(string connectionString, string tableName, DataTable dataTable)
-        {
-            if (dataTable.Rows.Count == 0)
-            {
-                Console.WriteLine("No hay datos para copiar.");
-                return;
-            }
 
-            Console.WriteLine($"Copiando {dataTable.Rows.Count} registros a la tabla destino...");
-
-            using (var connection = new MySqlConnection(connectionString))
-            {
-                await connection.OpenAsync();
-
-                // Construir la consulta de inserción
-                var columns = new List<string>();
-                var parameters = new List<string>();
-
-                foreach (DataColumn column in dataTable.Columns)
-                {
-                    columns.Add($"`{column.ColumnName}`");
-                    parameters.Add($"@{column.ColumnName}");
-                }
-
-                string insertQuery = $"INSERT INTO `{tableName}` ({string.Join(", ", columns)}) VALUES ({string.Join(", ", parameters)})";
-
-                // Batch insert para mejorar el rendimiento
-                int batchSize = 100;
-                int totalRecords = dataTable.Rows.Count;
-                int processedRecords = 0;
-
-                // Verificar si la tabla tiene muchos registros para ajustar el intervalo de progreso
-                int progressInterval = totalRecords > 1000 ? 100 : 10;
-
-                // No usamos using para la transacción, la administramos manualmente
-                MySqlTransaction transaction = await connection.BeginTransactionAsync();
-
-                try
-                {
-                    for (int i = 0; i < totalRecords; i++)
-                    {
-                        using (var command = new MySqlCommand(insertQuery, connection, transaction))
-                        {
-                            foreach (DataColumn column in dataTable.Columns)
-                            {
-                                command.Parameters.AddWithValue($"@{column.ColumnName}",
-                                    dataTable.Rows[i][column.ColumnName] ?? DBNull.Value);
-                            }
-
-                            await command.ExecuteNonQueryAsync();
-                        }
-
-                        processedRecords++;
-
-                        // Mostrar progreso
-                        if (processedRecords % progressInterval == 0 || processedRecords == totalRecords)
-                        {
-                            double percentage = (double)processedRecords / totalRecords * 100;
-                            Console.Write($"\rProgreso: {processedRecords}/{totalRecords} registros ({percentage:F2}%)");
-                        }
-
-                        // Commit cada batchSize registros
-                        if (processedRecords % batchSize == 0 || processedRecords == totalRecords)
-                        {
-                            await transaction.CommitAsync();
-
-                            // Iniciar una nueva transacción si no hemos terminado
-                            if (processedRecords < totalRecords)
-                            {
-                                transaction = await connection.BeginTransactionAsync();
-                            }
-                        }
-                    }
-
-                    Console.WriteLine("\nRegistros copiados exitosamente.");
-                }
-                catch (Exception ex)
-                {
-                    if (transaction != null)
-                    {
-                        await transaction.RollbackAsync();
-                    }
-                    throw new Exception($"Error al insertar datos: {ex.Message}", ex);
-                }
-            }
-        }
     }
 
     // Clase para serializar/deserializar las configuraciones

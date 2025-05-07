@@ -1,0 +1,18 @@
+{
+  "mateu_de_produccion_a_desarrollo": {
+    "Source": {
+      "Host": "adcconsultores.ddns.net",
+      "Port": "3306",
+      "User": "sigecre",
+      "Password": "cochi01",
+      "Database": "mateu"
+    },
+    "Target": {
+      "Host": "localhost",
+      "Port": "3306",
+      "User": "sigecre",
+      "Password": "cochi01",
+      "Database": "mateu"
+    }
+  }
+}
